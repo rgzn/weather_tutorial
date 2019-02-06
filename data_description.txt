@@ -1,0 +1,32 @@
+
+101, hourly:
+
+01: arrayid: 101
+02: year
+03: day
+04: hhmm
+05: Batt_Volt(avg)
+06: mSec_4(avg)
+07: T107CAir(avg)
+08: T107CGrd(avg)
+09: WndSpd_ms(max)
+10: WndSpd_ms(avg)
+11: "
+12: WindDirDg
+13: wind_unknown?
+14: SnwDpth
+15: Rain_mm (total)
+
+102, daily:
+
+01: arrayid: 102
+02: year
+03: day
+04: hhmm
+05: Volm_Sl_W(max)
+06: Volm_Sl_W(min)
+07: Volm_Sl_W(avg)
+08: T107CGrd(max)
+09: T107CGrd(min)
+10: T107CAir(max)
+11: T107CAir(min)

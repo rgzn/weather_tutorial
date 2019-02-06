@@ -1,0 +1,271 @@
+---
+title: "SNBS Weather Summaries"
+author: "jmw jonathan.weissman@wildlife.ca.gov"
+output: html_notebook
+---
+
+This notebook contains examples of how to process and plot weather data from the SNBS weather stations. The code in this notebook assumes that data is in "./data/" directory relative to the location of this file. 
+
+Before going further, load the required packages: 
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(RColorBrewer)
+```
+
+Now let's take a look at the data files. 
+
+The data is recorded by the Campbell Scienfitific CR10X dataloggers onto SM4M storage modules. I extracted the records using the CSI SMS.exe software, to write out csv files. Some of the storage modules were corrupted and required multiple readouts. For each storage module, I extracted as many files as possible, concatenated them, and then deleted non-unique lines. There were some bad lines, where commas were missing or two records were written to a single line. I used standard linux tools like grep and sed to search for lines that were improperly formatted and then manually either corrected them or deleted them if I couldn't correct them. This process was done mostly on the linux command line and I won't cover the details here. 
+
+Once that process was done, we are left with ".dat" csv file for each weather station. Here are the files:
+
+```{r}
+list.files("./data/")
+```
+Let's take a look at the format of one of these data files: 
+```{R}
+read_lines("./data/lvh.dat", n_max = 11)
+```
+
+We can see two types of records stored in these files. One type of record has an initial entry of "401" and one of "402". These correspond to two different recording schedules on the datalogger. The first entry, x01 or x02 is the array label. In our case, x01 records are hourly data and x02 records are daily data. The first digit of the array entry is different for each datalogger, or should be. When uploading data it is important to manually record which station the storage module came from. It is unwise to assume that datalogger was programmed to correctly label the arrays!
+
+We're now ready to import data into R. Here are functions to translate a .dat file into a long-formatted dataframe. 
+```{R}
+# fields2datetime
+# create single datetime field out of separate year, hour, time fields
+fields2datetime = function(year=2017, day=0, time=0) {
+  TZ_PST = "US/Pacific"
+  d = make_datetime(year, 1, 1, hour=time/100, min=time %% 100, tz=TZ_PST)
+  yday(d) = day
+  return(d)
+}
+
+# dat2df
+# read a Campbell .dat file as input and return a long dataframe. 
+dat2df = function(datFile) {
+  rawDat = read.csv(datFile, header=F, sep=",")
+  names(rawDat)[1:4] = c("array", "year", "day", "time") # label the common columns
+  rawDat = rawDat %>% mutate(dt = fields2datetime(year, day, time))
+  
+  # Split data into 2 separate dataframes based on array:
+  datArray1 = rawDat[ (rawDat$array %% 10) == 1 , c(1,16,5:15)]
+  datArray2 = rawDat[ (rawDat$array %% 10) == 2 , c(1,16,5:11)]
+  
+  # label the data fields, detailed description in comments
+  array1Labels = c("array", "datetime","batV","mSec4","tAir","tGrd","wSpdMax","wSpd","wSpd2","wDir","wUnk","snwD","rain")
+  array2Labels = c("array", "datetime","volmSlMax","volmSlMin","volmSl","tGrdMax","tGrdMin","tAirMax","tAirMin")
+  names(datArray1) = array1Labels
+  names(datArray2) = array2Labels
+  array1Long = datArray1 %>% 
+    gather(key = "record", value = "value", -datetime, -array)
+  array2Long = datArray2 %>% 
+    gather(key = "record", value = "value", -datetime, -array)
+  datDF = full_join(array1Long, array2Long)
+  datDF = datDF %>% arrange(datetime) 
+  datDF = datDF %>% filter(!is.na(datetime)) # remove invalid datetimes
+  return(datDF) 
+}
+
+lvh = dat2df("./data/lvh.dat")
+
+head(lvh)
+```
+
+I want to combine the data from all the stations into a single dataframe. We have everything we need to do that with our current dataframe format, but I don't like how the station ID is currently denoted only as the first digit of the array label. I want to add another column with an actual human-readable station name.
+
+First let's define the names and ids:
+
+```{R}
+station = c("Wheeler_Lo", "Wheeler_Hi", "LeeVining_Lo", "LeeVining_Hi", "Baxter_Lo")
+stn = c("whl", "whh", "lvl", "lvh", "bxl")
+id = c(1,2,3,4,5)
+
+stations = data.frame(station, stn, id, stringsAsFactors=FALSE)
+stations
+```
+
+Now we can concatenate all of our data and add the labels. I'm also going to change the array field to record_type, which will be hourly or daily.
+
+```{R}
+# make list of all files:
+fileList = list.files("./data/", full.names = TRUE)
+
+allDats = lapply(fileList, dat2df)
+
+wxAll = allDats %>% reduce(full_join) %>% distinct()
+wxAll = wxAll %>% mutate(id = array %/% 100 )
+wxAll = left_join(wxAll, stations, by="id")
+
+wxAll = wxAll %>% mutate(type = array %% 10 ) 
+
+head(wxAll)
+```
+There is one more problem, we have some duplicate data points. I don't know how best to deal with this, but I will just keep whichever one comes first: 
+```{R}
+# These should be equal:
+nrow(wxAll)
+nrow(wxAll %>% distinct(datetime, type, record, id, stn))
+
+# Hack to keep only one measurement for a given time, record, station, and array:
+wxAll  = wxAll %>% distinct(datetime, type, record, id, stn, .keep_all=TRUE)
+
+```
+
+
+Now all of our records are in one long-format dataframe. This is perfect for plotting with ggplot, so let's start
+
+A big issue with this inconsistent data is determining which periods from which stations are valid. THe main thing that messes up a station is the battery dying. So let's look at battery voltages for the stations:
+
+```{R}
+
+batPlot = ggplot(wxAll %>% filter(record == "batV" & type == 1)) +
+  geom_point(aes(x=datetime, y=value, color = stn), alpha=0.05)  + 
+  ylim(12,14.5)
+
+batPlot
+
+```
+
+The first thing that's noticeable is that we have data from 2031. We haven't cleaned the data enough yet! This is because a dead battery can cause the clock to reset. The records look valid but the clock is totally off. Let's eliminate data with dates obviously out of range and take another look. 
+
+```{R}
+maxDate = as.POSIXct(today())
+wxAll = wxAll %>% filter(datetime < maxDate)
+
+batPlot = ggplot(wxAll %>% filter(record == "batV" & type == 1)) +
+  geom_point(aes(x=datetime, y=value, color = stn), alpha=0.05)  + 
+  ylim(12,14.5)
+
+batPlot
+```
+
+This graph looks a bit of a mess, but it can be used as a starting point to determine what periods had bad or no data for each station. You might notice there isn't really any data below 12 Volts on the battery. This is because below 12V, the clock will probably reset and subsequent records will be in a bad time range, and hence filtered out of our plot. 
+
+I haven't yet bothered to write an automated way to select good date ranges. As such, I'm going to manually pick a good date range for one station and then go into how to look at some of the data from it. 
+
+Let's look at one station: 
+
+```{R}
+whlBat = ggplot(wxAll %>% filter(record == "batV" & type == 1 & stn == "whl")) +
+  geom_point(aes(x=datetime, y=value, color = stn), alpha=0.05)  + 
+  ylim(12,14.5)
+
+whlBat  
+```
+I'm noticing an early dip, after which the station was serviced and back up, and then a long slow decline while the station went neglected. 
+Things to note: there are 3 distinct lines within the overall line. Looking at this data at a smaller timescale can illuminate why.
+
+```{R}
+
+startDate = as.POSIXct(ymd(20100401))
+endDate = as.POSIXct(ymd(20100405))
+
+whlBatDaily = ggplot(wxAll %>% filter( record == "batV" & 
+                                  type == 1 & 
+                                  stn == "whl" &
+                                  datetime > startDate &
+                                  datetime < endDate
+                                    )) +
+  geom_point(aes(x=datetime, y=value, color = stn), alpha=0.9)  + 
+  ylim(12,14.5)
+
+whlBatDaily  
+```
+
+Now we can clearly see that the 3 lines are made by the daily charge cycle. You can also see the seasonal variation in charge on a yearly scale. Note that the solar panels are highly tilted, pointing to the South. 
+
+```{R}
+
+startDate = as.POSIXct(ymd(20100501))
+endDate = as.POSIXct(ymd(20110430))
+
+whlBatYearly = ggplot(wxAll %>% filter( record == "batV" & 
+                                  type == 1 & 
+                                  stn == "whl" &
+                                  datetime > startDate &
+                                  datetime < endDate
+                                    )) +
+  geom_point(aes(x=datetime, y=value, color = stn), alpha=0.5)  + 
+  ylim(12,14.5)
+
+whlBatYearly
+```
+
+
+I haven't yet decided how best to filter bad battery voltages, so let's move on to actual weather data. 
+The snow depth sensors tended to be reliable:
+
+```{R}
+snowWhl = ggplot(wxAll %>% filter( record == "snwD" & 
+                                  stn == "whl")) +
+  geom_point( aes(x=datetime, y=value), size=0.01, alpha=0.5, colour="#0000CC") +
+  ylim(0, 0.8) +
+  xlab("time") +
+  ylab("snow depth (m)") + 
+  ggtitle("Wheeler Low Elevation Snow Long Term")
+  
+snowWhl
+```
+And temperature over a similar time period: 
+```{R}
+tempWhl = ggplot(wxAll %>% filter( record == "tAir" & 
+                                  stn == "whl")) +
+  geom_point( aes(x=datetime, y=value), size=0.01, alpha=0.5, colour="#CC00CC") +
+  xlab("time") +
+  ylab("air temp (C)") + 
+  ggtitle("Wheeler Low Elevation Temp Long Term")
+  
+tempWhl 
+```
+
+Ok that's kind of boring. Wind data is pretty interesting. Let's look at some ways to plot it: 
+
+```{R}
+
+startDate = as.POSIXct(ymd(20100501))
+endDate = as.POSIXct(ymd(20110430))
+
+windWhl = ggplot(wxAll %>% filter( (record == "wSpd" | record == "wSpdMax") &
+                                     stn == "whl" &
+                                     datetime > startDate &
+                                     datetime < endDate )) +
+  geom_point(aes(x=datetime, y=value, col=record), size=0.4, alpha=0.3) + 
+  scale_color_manual(name="hourly", labels=c("avg", "max"), values=alpha(c("blue","red"), .2)) +
+  xlab("time") +
+  ylab("Wind speed in m/s") +
+  ggtitle("Wheeler Low Elevation Wind Speed Long Term")
+
+windWhl
+
+```
+
+Wind direction changes a lot, and it's hard to visualize on cartesian coordinates. One way to look at it for a given time period is as a wind rose on polar coordinates. In this case the wind direction is angle, and the magnitude is the wind speed. We can do a scatter plot on such coordinates. The downside is that it contains no information about the sequence of the measurements. To do this, I do need to transform the data into a wide dataframe
+
+```{R}
+startDate = as.POSIXct(ymd(20100501))
+endDate = as.POSIXct(ymd(20110430))
+
+
+wind = wxAll %>% 
+  filter(type == 1) %>% 
+  filter( record %in% c("wSpd", "wSpdMax", "wDir") ) %>%
+  spread(record, value)
+
+polarWindWhl = ggplot(wind %>% filter( stn == "whl" & 
+                                         datetime > startDate & 
+                                         datetime < endDate )) +
+  geom_point(aes(x=wDir, y=wSpdMax), color="red", alpha=0.1, shape=16) +
+  geom_point(aes(x=wDir, y=wSpd), color="blue", alpha=0.1, shape=16) +
+  coord_polar() +
+  scale_x_continuous(labels = c("N","NE","E","SE","S","SW","W","NW"),
+                     breaks = c(0, 45, 90, 135, 180, 225, 270, 315)) +
+  scale_y_continuous(name="m/s", breaks=c(0,5,10,15,20,25,30),limits=c(0,20)) +
+  ylim(0,18) +
+  ylab("") + 
+  xlab("blue: hly avg | red: hly max") +
+  ggtitle("Scatterplot of wind speed vs. direction for AY 2010/11")
+
+polarWindWhl
+  
+```
